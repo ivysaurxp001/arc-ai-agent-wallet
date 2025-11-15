@@ -139,6 +139,13 @@ npm run dev
      ```
 5. Railway will use build commands from `railway.json` (builds from `backend/` directory)
 6. Deploy (auto-deploys on push to main branch)
+7. **Get Backend URL:**
+   - After deployment, go to your service → **Settings** tab
+   - Scroll to **"Networking"** section
+   - Find **"Public Domain"** or click **"Generate Domain"**
+   - Copy the URL (e.g., `https://your-service.up.railway.app`)
+   - **Test it:** Open `https://your-service.up.railway.app/healthz` in browser
+   - Should see: `{"status":"ok","chainId":5042002,...}`
 
 **Option 2: Render**
 1. Create new Web Service
@@ -148,6 +155,32 @@ npm run dev
 5. Add environment variables (same as above)
 
 **Important:** After deploying backend, update `VITE_API_URL` in Vercel with your backend URL.
+
+### Next Steps After Backend Deployment
+
+1. **Test Backend:**
+   ```bash
+   curl https://your-railway-url.up.railway.app/healthz
+   ```
+   Should return: `{"status":"ok",...}`
+
+2. **Configure Vercel Frontend:**
+   - Go to Vercel Dashboard → Your Project → **Settings** → **Environment Variables**
+   - Add new variable:
+     - **Key:** `VITE_API_URL`
+     - **Value:** `https://your-railway-url.up.railway.app` (no trailing slash)
+   - **Redeploy** frontend (or push a commit to trigger auto-deploy)
+
+3. **Verify Connection:**
+   - Open your Vercel frontend URL
+   - Open browser DevTools → Network tab
+   - Try creating an agent
+   - Check if API calls go to your Railway backend URL (not `/api`)
+
+4. **Troubleshooting:**
+   - If you see CORS errors, backend CORS is already configured to allow all origins
+   - If API calls fail, check Railway logs: Service → **Deployments** → Click latest deployment → **View Logs**
+   - Ensure all environment variables are set correctly in Railway
 
 ## Security Notes
 
