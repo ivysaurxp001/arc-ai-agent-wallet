@@ -23,6 +23,7 @@ import {
 import { formatBaseUnits, parseUsdToBaseUnits } from "./utils/amount";
 import { useWallet } from "./hooks/useWallet";
 import { WalletButton } from "./components/WalletButton";
+import { encryptPrivateKey, decryptPrivateKey, isEncrypted } from "./utils/encryption";
 import { agentWalletAbi } from "./abi/agentWalletAbi";
 import { erc20Abi } from "./abi/erc20Abi";
 import { decodeEventLog, createWalletClient, createPublicClient, http, serializeTransaction, toSerializableTransaction, parseEther, formatEther, getAddress, encodeFunctionData } from "viem";
@@ -36,8 +37,9 @@ type AgentSummary = {
   agentId: number;
   agentAddress: `0x${string}`;
   ownerAddress: `0x${string}`;
-  privateKey: `0x${string}`;
+  privateKey: `0x${string}` | string; // Can be encrypted string or plain private key
   transactionHash: `0x${string}`;
+  encrypted?: boolean; // Flag to indicate if private key is encrypted
 };
 
 type LogEntry = {
@@ -65,6 +67,7 @@ const initialFundGasForm = {
 };
 
 const AGENTS_STORAGE_KEY = "arc-agent-wallet-agents";
+const ENCRYPTION_PASSWORD_KEY = "arc-agent-wallet-encryption-password"; // Store password hash, not plain password
 
 // Helper to deserialize BigInt recursively (convert string back to BigInt for viem)
 const deserializeBigInt = (obj: any): any => {
@@ -91,6 +94,63 @@ const deserializeBigInt = (obj: any): any => {
 
 const App = () => {
   const wallet = useWallet();
+  
+  // Password modal state
+  const [passwordModal, setPasswordModal] = useState<{
+    open: boolean;
+    title: string;
+    message: string;
+    resolve: ((value: string | null) => void) | null;
+  }>({
+    open: false,
+    title: "",
+    message: "",
+    resolve: null
+  });
+  
+  const [passwordInput, setPasswordInput] = useState("");
+  
+  // Helper function to show password modal
+  const showPasswordModal = (
+    title: string,
+    message: string
+  ): Promise<string | null> => {
+    return new Promise((resolve) => {
+      setPasswordInput("");
+      setPasswordModal({
+        open: true,
+        title,
+        message,
+        resolve
+      });
+    });
+  };
+  
+  // Handle confirm button click
+  const handlePasswordConfirm = () => {
+    if (passwordModal.resolve) {
+      const password = passwordInput.trim();
+      passwordModal.resolve(password.length > 0 ? password : null);
+      setPasswordModal({ open: false, title: "", message: "", resolve: null });
+      setPasswordInput("");
+    }
+  };
+  
+  // Handle cancel button click
+  const handlePasswordCancel = () => {
+    if (passwordModal.resolve) {
+      passwordModal.resolve(null);
+      setPasswordModal({ open: false, title: "", message: "", resolve: null });
+      setPasswordInput("");
+    }
+  };
+  
+  // Handle Enter key in password modal
+  const handlePasswordKeyPress = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter" && passwordInput.length > 0) {
+      handlePasswordConfirm();
+    }
+  };
   
   // Load agents from localStorage on mount
   const [agents, setAgents] = useState<AgentSummary[]>(() => {
@@ -131,9 +191,17 @@ const App = () => {
   const [whitelistMerchantAddress, setWhitelistMerchantAddress] = useState("");
   const [whitelistAllowed, setWhitelistAllowed] = useState(true);
 
+  // Filter agents to only show those owned by connected wallet
+  const ownedAgents = useMemo(() => {
+    if (!wallet.address) return [];
+    return agents.filter(
+      (agent) => agent.ownerAddress.toLowerCase() === wallet.address!.toLowerCase()
+    );
+  }, [agents, wallet.address]);
+
   const selectedAgent = useMemo(
-    () => agents.find((agent) => agent.agentId === selectedAgentId) ?? null,
-    [agents, selectedAgentId]
+    () => ownedAgents.find((agent) => agent.agentId === selectedAgentId) ?? null,
+    [ownedAgents, selectedAgentId]
   );
 
   const { data: agentDetails, refetch: refetchAgentDetails, isFetching: isFetchingAgentDetails } = useQuery<
@@ -239,21 +307,55 @@ const App = () => {
       return registerAgent({ dailyLimit, perTxLimit });
       }
     },
-    onSuccess: (data) => {
+    onSuccess: async (data) => {
       const agentId = Number(data.agentId);
       
       // Verify private key exists
       if (!data.agentPrivateKey) {
         console.error("Agent created but private key is missing!", data);
-        appendLog(`⚠️ Agent ${agentId} created but private key is missing! This agent cannot make payments.`);
+        appendLog(`Warning: Agent ${agentId} created but private key is missing! This agent cannot make payments.`);
       }
       
-      const newAgent = {
+      // Ask user if they want to encrypt the private key
+      let privateKeyToStore: string = data.agentPrivateKey || "";
+      let isEncryptedFlag = false;
+      
+      if (data.agentPrivateKey) {
+        const encryptChoice = confirm(
+          "Do you want to encrypt the agent private key with a password?\n\n" +
+          "YES: More secure, but you'll need to enter password each time you make a payment.\n" +
+          "NO: Less secure, but more convenient (stored in plain text).\n\n" +
+          "Note: This is a testnet application. For production, encryption is recommended."
+        );
+        
+        if (encryptChoice) {
+          const password = await showPasswordModal(
+            "Encrypt Private Key",
+            "Enter a password to encrypt the private key. You'll need this password when making payments."
+          );
+          if (password && password.length > 0) {
+            try {
+              privateKeyToStore = await encryptPrivateKey(data.agentPrivateKey, password);
+              isEncryptedFlag = true;
+              appendLog("Private key encrypted and stored securely.");
+            } catch (error) {
+              appendLog(`Warning: Failed to encrypt private key: ${(error as Error).message}. Storing in plain text.`);
+              privateKeyToStore = data.agentPrivateKey;
+            }
+          } else {
+            appendLog("No password provided. Storing private key in plain text.");
+            privateKeyToStore = data.agentPrivateKey;
+          }
+        }
+      }
+      
+      const newAgent: AgentSummary = {
           agentId,
           agentAddress: data.agentAddress,
           ownerAddress: data.ownerAddress,
-        privateKey: data.agentPrivateKey || "" as `0x${string}`, // Fallback to empty string if missing
-          transactionHash: data.transactionHash
+          privateKey: privateKeyToStore,
+          transactionHash: data.transactionHash,
+          encrypted: isEncryptedFlag
       };
       
       console.log("Adding new agent to state:", newAgent);
@@ -268,21 +370,25 @@ const App = () => {
       });
       setSelectedAgentId(agentId);
       appendLog(
-        `🆕 Agent ${agentId} created → address ${data.agentAddress}, tx ${shortHash(data.transactionHash)}`
+        `Agent ${agentId} created → address ${data.agentAddress}, tx ${shortHash(data.transactionHash)}`
       );
-      if (data.agentPrivateKey) {
+      if (data.agentPrivateKey && !isEncryptedFlag) {
         appendLog(
-          `🔑 Agent Private Key: ${data.agentPrivateKey} (IMPORTANT: Store this securely! You need it for payments.)`
+          `Agent Private Key: ${data.agentPrivateKey} (IMPORTANT: Store this securely! You need it for payments.)`
+        );
+      } else if (isEncryptedFlag) {
+        appendLog(
+          `Agent Private Key: [ENCRYPTED] (Password-protected. You'll need to enter password when making payments.)`
         );
       } else {
         appendLog(
-          `⚠️ WARNING: Agent private key is missing! This agent cannot make payments.`
+          `WARNING: Agent private key is missing! This agent cannot make payments.`
         );
       }
       setRegisterForm(initialRegisterForm);
     },
     onError: (error) => {
-      appendLog(`❌ Failed to create agent: ${(error as Error).message}`);
+      appendLog(`Failed to create agent: ${(error as Error).message}`);
     }
   });
 
@@ -291,7 +397,7 @@ const App = () => {
       if (selectedAgentId === null) throw new Error("Select an agent first");
 
       // Get agent owner from details
-      const agentInfo = agents.find((a) => a.agentId === selectedAgentId);
+      const agentInfo = ownedAgents.find((a) => a.agentId === selectedAgentId);
       const agentOwner = agentInfo?.ownerAddress;
 
       if (!agentOwner) {
@@ -344,7 +450,7 @@ const App = () => {
     },
     onSuccess: (data) => {
       appendLog(
-        `✅ Merchant ${shortAddress(whitelistMerchantAddress)} ${
+        `Merchant ${shortAddress(whitelistMerchantAddress)} ${
           whitelistAllowed ? "whitelisted" : "removed"
         } for agent ${selectedAgentId} (tx ${data.transactionHash ? shortHash(data.transactionHash) : "pending"})`
       );
@@ -352,7 +458,7 @@ const App = () => {
       void refetchAgentDetails();
     },
     onError: (error) => {
-      appendLog(`❌ Failed to update whitelist: ${(error as Error).message}`);
+      appendLog(`Failed to update whitelist: ${(error as Error).message}`);
     }
   });
 
@@ -368,8 +474,25 @@ const App = () => {
       };
 
       // Get agent private key from localStorage (if available)
-      const agentInfo = agents.find((a) => a.agentId === selectedAgentId);
-      const agentPrivateKey = agentInfo?.privateKey;
+      const agentInfo = ownedAgents.find((a) => a.agentId === selectedAgentId);
+      let agentPrivateKey = agentInfo?.privateKey;
+
+      // Decrypt private key if it's encrypted
+      if (agentPrivateKey && isEncrypted(agentPrivateKey)) {
+        // Get encryption password from user
+        const password = await showPasswordModal(
+          "Decrypt Private Key",
+          "Enter password to decrypt agent private key for payment."
+        );
+        if (!password) {
+          throw new Error("Password required to decrypt private key");
+        }
+        try {
+          agentPrivateKey = await decryptPrivateKey(agentPrivateKey, password) as `0x${string}`;
+        } catch (error) {
+          throw new Error(`Failed to decrypt private key: ${(error as Error).message}. Wrong password?`);
+        }
+      }
 
       // If agent private key is available, use frontend signing
       if (agentPrivateKey) {
@@ -511,7 +634,7 @@ const App = () => {
               });
               if (decoded.eventName === "AgentPayment") {
                 paymentEvent = decoded;
-                console.log("✅ AgentPayment event found:", {
+                console.log("AgentPayment event found:", {
                   agentId: decoded.args.agentId?.toString(),
                   merchant: decoded.args.merchant,
                   amount: decoded.args.amount?.toString(),
@@ -574,7 +697,7 @@ const App = () => {
           if (errorMessage.includes("insufficient funds") || errorMessage.includes("have 0 want")) {
             const agentAddress = prepareData?.agentAddress || agentInfo?.agentAddress || "unknown";
             throw new Error(
-              `❌ Payment failed: Agent address (${agentAddress}) does not have enough native token (USDC) to pay for gas. ` +
+              `Payment failed: Agent address (${agentAddress}) does not have enough native token (USDC) to pay for gas. ` +
               `The agent needs native USDC in its wallet to pay transaction fees. ` +
               `Please send some native USDC to the agent address to cover gas fees. ` +
               `Alternatively, use backend signing if the agent exists in backend.`
@@ -603,7 +726,7 @@ const App = () => {
           
           if (errorMessage.includes("404") || errorMessage.includes("Unknown agentId") || errorMessage.includes("not found")) {
             throw new Error(
-              "❌ Payment failed: Agent private key not found.\n\n" +
+              "Payment failed: Agent private key not found.\n\n" +
               "Possible causes:\n" +
               "1. Agent was created with frontend wallet signing but localStorage was cleared\n" +
               "2. Agent was created with backend but backend was restarted (agentStore is in-memory)\n" +
@@ -623,15 +746,15 @@ const App = () => {
       const explorerUrl = `https://testnet.arcscan.app/tx/${data.transactionHash}`;
       const paymentEvent = (data as any).paymentEvent;
       
-      let logMessage = `💸 Payment ${formatBaseUnits(data.amount)} USDC to ${shortAddress(data.merchant)} ` +
+      let logMessage = `Payment ${formatBaseUnits(data.amount)} USDC to ${shortAddress(data.merchant)} ` +
         `(agent ${data.agentId}) | ` +
         `Hash: ${data.transactionHash} | ` +
-        `🔗 View on Explorer: ${explorerUrl}`;
+        `View on Explorer: ${explorerUrl}`;
       
       if (paymentEvent) {
-        logMessage += `\n   ✅ Verified: AgentPayment event confirmed in transaction logs`;
-        logMessage += `\n   📋 Event details: agentId=${paymentEvent.args.agentId}, merchant=${shortAddress(paymentEvent.args.merchant)}, amount=${formatBaseUnits(paymentEvent.args.amount?.toString() || data.amount)}`;
-        logMessage += `\n   💡 Note: USDC transfer is an internal transaction. Check "Token transfers" tab on explorer to see the actual USDC transfer.`;
+        logMessage += `\n   Verified: AgentPayment event confirmed in transaction logs`;
+        logMessage += `\n   Event details: agentId=${paymentEvent.args.agentId}, merchant=${shortAddress(paymentEvent.args.merchant)}, amount=${formatBaseUnits(paymentEvent.args.amount?.toString() || data.amount)}`;
+        logMessage += `\n   Note: USDC transfer is an internal transaction. Check "Token transfers" tab on explorer to see the actual USDC transfer.`;
       }
       
       appendLog(logMessage);
@@ -639,7 +762,7 @@ const App = () => {
       void refetchAgentDetails();
     },
     onError: (error) => {
-      appendLog(`❌ Payment failed: ${(error as Error).message}`);
+      appendLog(`Payment failed: ${(error as Error).message}`);
     }
   });
 
@@ -648,7 +771,7 @@ const App = () => {
       if (selectedAgentId === null) throw new Error("Select an agent first");
 
       // Get agent owner from details
-      const agentInfo = agents.find((a) => a.agentId === selectedAgentId);
+      const agentInfo = ownedAgents.find((a) => a.agentId === selectedAgentId);
       const agentOwner = agentInfo?.ownerAddress;
 
       // If wallet is connected and matches agent owner, use frontend signing
@@ -696,12 +819,12 @@ const App = () => {
     onSuccess: (data) => {
       const action = data.active ? "resumed" : "paused";
       appendLog(
-        `⏸️ Agent ${selectedAgentId} ${action} (tx ${data.transactionHash ? shortHash(data.transactionHash) : "pending"})`
+        `Agent ${selectedAgentId} ${action} (tx ${data.transactionHash ? shortHash(data.transactionHash) : "pending"})`
       );
       void refetchAgentDetails();
     },
     onError: (error) => {
-      appendLog(`❌ Failed to pause/resume agent: ${(error as Error).message}`);
+      appendLog(`Failed to pause/resume agent: ${(error as Error).message}`);
     }
   });
 
@@ -710,7 +833,7 @@ const App = () => {
       if (selectedAgentId === null) throw new Error("Select an agent first");
 
       // Get agent owner from details
-      const agentInfo = agents.find((a) => a.agentId === selectedAgentId);
+      const agentInfo = ownedAgents.find((a) => a.agentId === selectedAgentId);
       const agentOwner = agentInfo?.ownerAddress;
 
       const payload: { agentId: number; amount?: string } = {
@@ -768,14 +891,14 @@ const App = () => {
     onSuccess: (data) => {
       const amountText = data.amount === "all" ? "all funds" : `${formatBaseUnits(data.amount)} USDC`;
       appendLog(
-        `💰 Withdrew ${amountText} from agent ${selectedAgentId} ` +
+        `Withdrew ${amountText} from agent ${selectedAgentId} ` +
           `(new balance: ${data.newBalance ? formatBaseUnits(data.newBalance) : "N/A"} USDC, ` +
           `tx ${data.transactionHash ? shortHash(data.transactionHash) : "pending"})`
       );
       void refetchAgentDetails();
     },
     onError: (error) => {
-      appendLog(`❌ Failed to withdraw: ${(error as Error).message}`);
+      appendLog(`Failed to withdraw: ${(error as Error).message}`);
     }
   });
 
@@ -785,7 +908,7 @@ const App = () => {
       const amount = parseUsdToBaseUnits(depositForm.amount).toString();
 
       // Get agent owner from details
-      const agentInfo = agents.find((a) => a.agentId === selectedAgentId);
+      const agentInfo = ownedAgents.find((a) => a.agentId === selectedAgentId);
       const agentOwner = agentInfo?.ownerAddress;
 
       // If wallet is connected and matches agent owner, use frontend signing
@@ -873,19 +996,21 @@ const App = () => {
     },
     onSuccess: (data: DepositResponse) => {
       appendLog(
-        `💰 Deposited ${formatBaseUnits(data.amount)} USDC to agent ${data.agentId} ` +
+        `Deposited ${formatBaseUnits(data.amount)} USDC to agent ${data.agentId} ` +
           `(new balance: ${formatBaseUnits(data.newBalance)} USDC, tx ${shortHash(data.transactionHash)})`
       );
       setDepositForm(initialDepositForm);
       void refetchAgentDetails();
     },
     onError: (error) => {
-      appendLog(`❌ Deposit failed: ${(error as Error).message}`);
+      appendLog(`Deposit failed: ${(error as Error).message}`);
     }
   });
 
   const handleSelectAgent = (agentId: number) => {
     setSelectedAgentId(agentId);
+    // Auto-switch to dashboard tab when agent is selected
+    setActiveTab("dashboard");
     // Query will auto-refetch when selectedAgentId changes
   };
 
@@ -935,13 +1060,13 @@ const App = () => {
     },
     onSuccess: (data) => {
       appendLog(
-        `✅ Funded agent address with ${fundGasForm.amount} native USDC for gas (tx ${shortHash(data.hash)})`
+        `Funded agent address with ${fundGasForm.amount} native USDC for gas (tx ${shortHash(data.hash)})`
       );
       setFundGasForm(initialFundGasForm);
       void refetchAgentNativeBalance();
     },
     onError: (error) => {
-      appendLog(`❌ Failed to fund gas: ${(error as Error).message}`);
+      appendLog(`Failed to fund gas: ${(error as Error).message}`);
     }
   });
 
@@ -955,31 +1080,222 @@ const App = () => {
     fundGasMutation.mutate();
   };
 
+  // Tab navigation state
+  const [activeTab, setActiveTab] = useState<"dashboard" | "agents" | "funding" | "payments">("dashboard");
+
   return (
     <div className="app-container">
       <header className="header layout">
-        <div>
-          <h1>Arc Agent Wallet Sandbox</h1>
-          <p className="muted">
-            Deploy, fund, and monitor sandbox AI agents with policy-enforced spending on Arc Testnet.
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", gap: "2rem" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "1rem", flex: 1 }}>
+            <div className="ai-gif-container">
+              <img 
+                src="/AI.gif" 
+                alt="AI Agent" 
+                className="ai-gif"
+                style={{ 
+                  width: "60px", 
+                  height: "60px", 
+                  objectFit: "contain",
+                  filter: "drop-shadow(0 0 10px rgba(217, 119, 6, 0.5))"
+                }}
+              />
+            </div>
+            <div style={{ flex: 1 }}>
+              <h1 style={{ marginBottom: "0.25rem" }}>Arc Agent Wallet</h1>
+              <p className="muted" style={{ display: "flex", alignItems: "center", gap: "0.5rem", fontSize: "0.85rem", margin: 0 }}>
+                <span className="ai-pulse" />
+                AI-Powered Autonomous Payment System
           </p>
         </div>
-        <div className="stack" style={{ alignItems: "flex-end" }}>
-          <WalletButton />
-          <span className="pill">Port: 5173 (proxy to backend)</span>
-          <span className="pill">Selected agent: {selectedAgentId ?? "—"}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
+            <WalletButton />
+            {selectedAgentId !== null && (
+              <span className="pill" style={{ background: "rgba(217, 119, 6, 0.25)", color: "#fbbf24" }}>
+                Agent #{selectedAgentId}
+              </span>
+            )}
+          </div>
+        </div>
+        {/* Tab Navigation in Header */}
+        <div className="tabs" style={{ marginTop: "1.5rem", marginBottom: 0 }}>
+          <button
+            className={clsx("tab", activeTab === "dashboard" && "active")}
+            onClick={() => setActiveTab("dashboard")}
+          >
+            Dashboard
+          </button>
+          <button
+            className={clsx("tab", activeTab === "agents" && "active")}
+            onClick={() => setActiveTab("agents")}
+          >
+            Agents
+          </button>
+          <button
+            className={clsx("tab", activeTab === "funding" && "active")}
+            onClick={() => setActiveTab("funding")}
+          >
+            Funding
+          </button>
+          <button
+            className={clsx("tab", activeTab === "payments" && "active")}
+            onClick={() => setActiveTab("payments")}
+          >
+            Payments
+          </button>
         </div>
       </header>
 
-      <main className="layout stack">
+      <main className="layout">
+
+        {/* Dashboard Tab */}
+        <div className={clsx("tab-content", activeTab === "dashboard" && "active")}>
+          <div className="stack">
+            {selectedAgentId !== null && (
         <section className="card">
           <h2>
-            Create Agent
-            <span className="tag">
+                  Agent Overview{" "}
+                  <button
+                    className={clsx("button", "secondary")}
+                    type="button"
+                    onClick={() => void refetchAgentDetails()}
+                    disabled={selectedAgentId === null || isFetchingAgentDetails}
+                  >
+                    Refresh
+                  </button>
+                </h2>
+                {!agentDetails ? (
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+                    <span className="spinner" />
+                    <span className="muted">Loading agent details...</span>
+                  </div>
+                ) : (
+                  <div className="grid">
+                    <div className="stack">
+                      <strong>On-chain policy</strong>
+                      <span className={agentDetails.policy.active ? "status-active" : "status-paused"}>
+                        {agentDetails.policy.active ? "Active" : "Paused"}
+                      </span>
+                      <span className="muted">
+                        Daily limit: {formatBaseUnits(agentDetails.policy.dailyLimit)} USDC
+                      </span>
+                      <span className="muted">
+                        Per tx limit: {formatBaseUnits(agentDetails.policy.perTxLimit)} USDC
+                      </span>
+                      <span className="muted">
+                        Spent today: {formatBaseUnits(agentDetails.policy.spentToday)} USDC
+                      </span>
+                      <div style={{ marginTop: "0.5rem", display: "flex", gap: "0.5rem" }}>
+                        <button
+                          className={clsx("button", "secondary")}
+                          type="button"
+                          onClick={() => pauseResumeMutation.mutate(!agentDetails.policy.active)}
+                          disabled={pauseResumeMutation.isPending}
+                        >
+                          {pauseResumeMutation.isPending ? (
+                            <>
+                              <span className="spinner" />
+                              Processing...
+                            </>
+                          ) : agentDetails.policy.active ? (
+                            <>Pause</>
+                          ) : (
+                            <>Resume</>
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="stack">
+                      <strong>Funding</strong>
+                      <span className="muted">
+                        Agent balance: {formatBaseUnits(agentDetails.balance)} USDC
+                      </span>
+                      <span className="muted">
+                        Agent native balance (gas): {agentNativeBalance !== undefined ? formatEther(agentNativeBalance) : "Loading..."} USDC
+                      </span>
+                      {agentNativeBalance !== undefined && agentNativeBalance === BigInt(0) && (
+                        <span className="muted" style={{ color: "#d32f2f", fontSize: "0.875rem" }}>
+                          Warning: Agent address has no native USDC for gas! Fund it below.
+                        </span>
+                      )}
+                      <span className="muted">Owner: {shortAddress(agentDetails.owner)}</span>
+                      <span className="muted">Agent: {shortAddress(agentDetails.agent)}</span>
+                      {Number(agentDetails.balance) > 0 && (
+                        <div style={{ marginTop: "0.5rem", display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+                          <button
+                            className={clsx("button", "danger")}
+                            type="button"
+                            onClick={() => {
+                              if (confirm(`Are you sure you want to emergency withdraw all ${formatBaseUnits(agentDetails.balance)} USDC from agent ${selectedAgentId}?`)) {
+                                withdrawMutation.mutate();
+                              }
+                            }}
+                            disabled={withdrawMutation.isPending}
+                          >
+                            {withdrawMutation.isPending ? (
+                              <>
+                                <span className="spinner" />
+                                Withdrawing...
+                              </>
+                            ) : (
+                              <>Emergency Withdraw All</>
+                            )}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                    <div className="stack">
+                      <strong>Backend cache</strong>
+                      {agentDetails.locallyTracked ? (
+                        <>
+                          <span className="muted">Private key stored in relayer memory.</span>
+                          <span className="muted">
+                            Cached limits: daily {formatBaseUnits(agentDetails.locallyTracked.cachedDailyLimit)} /
+                            per-tx {formatBaseUnits(agentDetails.locallyTracked.cachedPerTxLimit)} USDC
+                          </span>
+                        </>
+                      ) : (
+                        <span className="muted">No cached record in backend (likely created elsewhere).</span>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </section>
+            )}
+            {selectedAgentId === null && (
+              <section className="card ai-assistant-card">
+                <div style={{ display: "flex", alignItems: "center", gap: "1.5rem" }}>
+                  <img src="/AI.gif" alt="AI Agent" className="ai-gif" style={{ width: "80px", height: "80px", objectFit: "contain" }} />
+                  <div style={{ flex: 1 }}>
+                    <h2>AI Agent Dashboard</h2>
+                    <p className="muted" style={{ marginBottom: "1rem" }}>
+                      Select an agent from the Agents tab to view its overview and activity.
+                    </p>
+                    <div className="ai-badge">
+                      <span>Ready to manage your AI agents</span>
+                    </div>
+                  </div>
+                </div>
+              </section>
+            )}
+          </div>
+        </div>
+
+        {/* Agents Tab */}
+        <div className={clsx("tab-content", activeTab === "agents" && "active")}>
+          <div className="stack">
+            <section className="card">
+              <h2>
+                Create AI Agent
+                <span className="tag" style={{ marginLeft: "1rem" }}>
               <span className="status-dot" />
-              Deployer {shortAddress(selectedAgent?.ownerAddress ?? "0x0000000000000000000000000000000000000000")}
+                  Deployer {shortAddress(selectedAgent?.ownerAddress ?? wallet.address ?? "0x0000000000000000000000000000000000000000")}
             </span>
           </h2>
+              <p className="muted" style={{ marginBottom: "1.5rem" }}>
+                Deploy a new AI agent with custom spending policies and limits.
+              </p>
           <form className="grid" onSubmit={handleRegisterSubmit}>
             <div className="input-group">
               <label htmlFor="dailyLimit">Daily limit (USDC)</label>
@@ -1005,19 +1321,46 @@ const App = () => {
             </div>
             <div className="input-group" style={{ alignSelf: "flex-end" }}>
               <button className="button" type="submit" disabled={registerMutation.isPending}>
-                {registerMutation.isPending ? "Creating..." : "Create Agent"}
+                {registerMutation.isPending ? (
+                  <>
+                    <span className="spinner" />
+                    Creating...
+                  </>
+                ) : (
+                  "Create Agent"
+                )}
               </button>
             </div>
           </form>
           {registerMutation.isError && (
-            <p className="muted">Error: {(registerMutation.error as Error)?.message ?? "Unknown error"}</p>
+            <div className="alert error">
+              <div>
+                <strong>Error creating agent:</strong>
+                <p style={{ margin: "0.25rem 0 0 0" }}>{(registerMutation.error as Error)?.message ?? "Unknown error"}</p>
+              </div>
+            </div>
           )}
         </section>
 
         <section className="card">
-          <h2>Registered Agents</h2>
-          {agents.length === 0 ? (
+          <h2>
+            Registered Agents
+            {ownedAgents.length > 0 && (
+              <span className="ai-badge" style={{ marginLeft: "1rem", fontSize: "0.75rem" }}>
+                {ownedAgents.length} active
+              </span>
+            )}
+          </h2>
+          {!wallet.isConnected ? (
+            <div style={{ textAlign: "center", padding: "2rem" }}>
+              <img src="/AI.gif" alt="AI Agent" className="ai-gif-large" style={{ marginBottom: "1rem" }} />
+              <p className="muted">Please connect your wallet to view your agents.</p>
+            </div>
+          ) : ownedAgents.length === 0 ? (
+            <div style={{ textAlign: "center", padding: "2rem" }}>
+              <img src="/AI.gif" alt="AI Agent" className="ai-gif-large" style={{ marginBottom: "1rem" }} />
             <p className="muted">No agents created yet. Deploy one to get started.</p>
+            </div>
           ) : (
             <div className="stack">
               <table className="table">
@@ -1030,7 +1373,7 @@ const App = () => {
                   </tr>
                 </thead>
                 <tbody>
-                  {agents.map((agent) => (
+                  {ownedAgents.map((agent) => (
                     <tr key={agent.agentId}>
                       <td>#{agent.agentId}</td>
                       <td>{shortAddress(agent.agentAddress)}</td>
@@ -1049,158 +1392,132 @@ const App = () => {
                 </tbody>
               </table>
               {selectedAgent && (
-                <div className="stack" style={{ marginTop: "1rem", padding: "1rem", backgroundColor: "#f5f5f5", borderRadius: "4px" }}>
+                <div className="stack" style={{ marginTop: "1.5rem", padding: "1.5rem", background: "rgba(217, 119, 6, 0.1)", border: "1px solid rgba(217, 119, 6, 0.2)", borderRadius: "12px" }}>
                   <div>
-                    <strong style={{ color: "#d32f2f" }}>⚠️ IMPORTANT: Agent Private Key</strong>
+                    <strong style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "1rem" }}>
+                      Agent Private Key
+                    </strong>
+                    <div className="alert warning" style={{ marginBottom: "1rem", background: "rgba(245, 158, 11, 0.1)", border: "1px solid rgba(245, 158, 11, 0.3)" }}>
+                      <div>
+                        <strong style={{ color: "#f59e0b" }}>Security Warning</strong>
+                        <p style={{ margin: "0.25rem 0 0 0", fontSize: "0.875rem" }}>
+                          This private key is stored in your browser's localStorage in plain text. This is NOT secure for production use.
+                          Anyone with access to your computer or malicious scripts can steal this key. Only use this for testing on testnet.
+                        </p>
+                      </div>
+                    </div>
                     {selectedAgent.privateKey ? (
                       <>
-                        <div style={{ marginTop: "0.5rem", display: "flex", gap: "0.5rem", alignItems: "center" }}>
-                          <p style={{ wordBreak: "break-all", fontFamily: "monospace", fontSize: "0.875rem", margin: 0, flex: 1 }}>
-                            {selectedAgent.privateKey}
-                          </p>
+                        <div className="alert success" style={{ marginBottom: "1rem" }}>
+                          <div>
+                            <strong>Private key found!</strong>
+                            <p style={{ margin: "0.25rem 0 0 0", fontSize: "0.875rem" }}>
+                              Store this securely offline! You need it to make payments. If you lose it, you cannot recover it.
+                              <strong style={{ color: "#ef4444", display: "block", marginTop: "0.5rem" }}>
+                                DO NOT share this key or use it on untrusted devices.
+                              </strong>
+                            </p>
+                          </div>
+                        </div>
+                        <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginBottom: "0.75rem" }}>
+                          <code style={{ 
+                            wordBreak: "break-all", 
+                            fontFamily: "monospace", 
+                            fontSize: "0.875rem", 
+                            padding: "0.75rem", 
+                            background: "rgba(28, 25, 23, 0.8)",
+                            border: "1px solid var(--border-color)",
+                            borderRadius: "8px",
+                            flex: 1,
+                            margin: 0
+                          }}>
+                            {selectedAgent.encrypted 
+                              ? "[ENCRYPTED - Enter password when making payments]"
+                              : selectedAgent.privateKey
+                            }
+                          </code>
                           <button
                             type="button"
-                            className="button secondary"
-                            style={{ fontSize: "0.75rem", padding: "0.25rem 0.5rem" }}
-                            onClick={() => {
-                              navigator.clipboard.writeText(selectedAgent.privateKey);
-                              appendLog("✅ Private key copied to clipboard!");
+                            className="copy-button"
+                            onClick={async () => {
+                              if (selectedAgent.encrypted && isEncrypted(selectedAgent.privateKey)) {
+                                const password = await showPasswordModal(
+                                  "Decrypt Private Key",
+                                  "Enter password to decrypt and copy private key."
+                                );
+                                if (!password) {
+                                  appendLog("Password required to decrypt private key.");
+                                  return;
+                                }
+                                try {
+                                  const decrypted = await decryptPrivateKey(selectedAgent.privateKey, password);
+                                  navigator.clipboard.writeText(decrypted);
+                                  appendLog("Private key decrypted and copied to clipboard!");
+                                } catch (error) {
+                                  appendLog(`Failed to decrypt: ${(error as Error).message}`);
+                                }
+                              } else {
+                                navigator.clipboard.writeText(selectedAgent.privateKey);
+                                appendLog("Private key copied to clipboard!");
+                              }
                             }}
                           >
-                            Copy
+                            {selectedAgent.encrypted ? "Decrypt & Copy" : "Copy"}
                           </button>
                         </div>
-                        <p className="muted" style={{ marginTop: "0.5rem", fontSize: "0.875rem" }}>
-                          ✅ Private key found! Store this securely! You need it to make payments. If you lose it, you cannot recover it.
-                        </p>
                       </>
                     ) : (
-                      <>
-                        <p style={{ marginTop: "0.5rem", wordBreak: "break-all", fontFamily: "monospace", fontSize: "0.875rem", color: "#d32f2f" }}>
-                          ❌ Private key not found!
-                        </p>
-                        <p className="muted" style={{ marginTop: "0.5rem", fontSize: "0.875rem" }}>
-                          This agent was likely created with backend signing (legacy) or the private key was lost. 
-                          You need to create a new agent with wallet signing to get a private key.
-                        </p>
-                      </>
+                      <div className="alert error">
+                        <div>
+                          <strong>Private key not found!</strong>
+                          <p style={{ margin: "0.25rem 0 0 0", fontSize: "0.875rem" }}>
+                            This agent was likely created with backend signing (legacy) or the private key was lost. 
+                            You need to create a new agent with wallet signing to get a private key.
+                          </p>
+                        </div>
+                      </div>
                     )}
                   </div>
-                  <div>
-                    <strong>Agent Address:</strong>
-                    <p style={{ fontFamily: "monospace", fontSize: "0.875rem" }}>{selectedAgent.agentAddress}</p>
-                  </div>
-                  <div>
-                    <strong>Creation Transaction:</strong>
-                  <p className="muted">
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "1rem", marginTop: "1rem" }}>
+                    <div>
+                      <strong style={{ fontSize: "0.875rem", color: "var(--text-muted)" }}>Agent Address</strong>
+                      <p style={{ fontFamily: "monospace", fontSize: "0.875rem", margin: "0.25rem 0 0 0", wordBreak: "break-all" }}>
+                        {selectedAgent.agentAddress}
+                      </p>
+                    </div>
+                    <div>
+                      <strong style={{ fontSize: "0.875rem", color: "var(--text-muted)" }}>Creation Transaction</strong>
+                      <p style={{ margin: "0.25rem 0 0 0" }}>
                     <a
                       href={`https://testnet.arcscan.app/tx/${selectedAgent.transactionHash}`}
                       target="_blank"
                       rel="noreferrer"
+                          style={{ color: "#d97706", textDecoration: "underline" }}
                     >
-                        {shortHash(selectedAgent.transactionHash)}
+                          {shortHash(selectedAgent.transactionHash)} ↗
                     </a>
                   </p>
+                    </div>
                   </div>
                 </div>
               )}
             </div>
           )}
         </section>
+          </div>
+        </div>
 
-        <section className="card">
-          <h2>
-            Agent Overview{" "}
-            <button
-              className={clsx("button", "secondary")}
-              type="button"
-              onClick={() => void refetchAgentDetails()}
-              disabled={selectedAgentId === null || isFetchingAgentDetails}
-            >
-              Refresh
-            </button>
-          </h2>
+        {/* Funding Tab */}
+        <div className={clsx("tab-content", activeTab === "funding" && "active")}>
+          <div className="stack">
           {selectedAgentId === null ? (
-            <p className="muted">Select an agent to inspect policy, balance, and spend.</p>
-          ) : !agentDetails ? (
-            <p className="muted">Loading agent details...</p>
-          ) : (
-            <div className="grid">
-              <div className="stack">
-                <strong>On-chain policy</strong>
-                <span className="muted">Status: {agentDetails.policy.active ? "Active" : "Paused"}</span>
-                <span className="muted">
-                  Daily limit: {formatBaseUnits(agentDetails.policy.dailyLimit)} USDC
-                </span>
-                <span className="muted">
-                  Per tx limit: {formatBaseUnits(agentDetails.policy.perTxLimit)} USDC
-                </span>
-                <span className="muted">
-                  Spent today: {formatBaseUnits(agentDetails.policy.spentToday)} USDC
-                </span>
-                <div style={{ marginTop: "0.5rem", display: "flex", gap: "0.5rem" }}>
-                  <button
-                    className={clsx("button", "secondary")}
-                    type="button"
-                    onClick={() => pauseResumeMutation.mutate(!agentDetails.policy.active)}
-                    disabled={pauseResumeMutation.isPending}
-                  >
-                    {pauseResumeMutation.isPending
-                      ? "..."
-                      : agentDetails.policy.active
-                        ? "⏸️ Pause"
-                        : "▶️ Resume"}
-                  </button>
-                </div>
-              </div>
-              <div className="stack">
-                <strong>Funding</strong>
-                <span className="muted">
-                  Agent balance: {formatBaseUnits(agentDetails.balance)} USDC
-                </span>
-                <span className="muted">
-                  Agent native balance (gas): {agentNativeBalance !== undefined ? formatEther(agentNativeBalance) : "Loading..."} USDC
-                </span>
-                {agentNativeBalance !== undefined && agentNativeBalance === BigInt(0) && (
-                  <span className="muted" style={{ color: "#d32f2f", fontSize: "0.875rem" }}>
-                    ⚠️ Agent address has no native USDC for gas! Fund it below.
-                  </span>
-                )}
-                <span className="muted">Owner: {shortAddress(agentDetails.owner)}</span>
-                <span className="muted">Agent: {shortAddress(agentDetails.agent)}</span>
-                {Number(agentDetails.balance) > 0 && (
-                  <div style={{ marginTop: "0.5rem", display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-                    <button
-                      className={clsx("button", "secondary")}
-                      type="button"
-                      onClick={() => withdrawMutation.mutate()}
-                      disabled={withdrawMutation.isPending}
-                    >
-                      {withdrawMutation.isPending ? "..." : "🚨 Emergency Withdraw All"}
-                    </button>
-                  </div>
-                )}
-              </div>
-              <div className="stack">
-                <strong>Backend cache</strong>
-                {agentDetails.locallyTracked ? (
-                  <>
-                    <span className="muted">Private key stored in relayer memory.</span>
-                    <span className="muted">
-                      Cached limits: daily {formatBaseUnits(agentDetails.locallyTracked.cachedDailyLimit)} /
-                      per-tx {formatBaseUnits(agentDetails.locallyTracked.cachedPerTxLimit)} USDC
-                    </span>
-                  </>
-                ) : (
-                  <span className="muted">No cached record in backend (likely created elsewhere).</span>
-                )}
-              </div>
-            </div>
-          )}
-        </section>
-
-        <section className="card">
-          <h2>Deposit / Withdraw USDC</h2>
+              <section className="card">
+                <h2>Funding</h2>
+                <p className="muted">Please select an agent from the Agents tab first.</p>
+              </section>
+            ) : (
+              <section className="card">
+                <h2>Deposit / Withdraw USDC</h2>
           <div className="grid" style={{ marginBottom: "1rem" }}>
             <div>
               <h3 style={{ fontSize: "1rem", marginBottom: "0.5rem" }}>Deposit</h3>
@@ -1215,22 +1532,34 @@ const App = () => {
                     onChange={(event) => setDepositForm((prev) => ({ ...prev, amount: event.target.value }))}
                     required
                   />
-                </div>
+              </div>
                 <div className="input-group" style={{ alignSelf: "flex-end" }}>
                   <button
                     className="button"
                     type="submit"
                     disabled={selectedAgentId === null || depositMutation.isPending}
                   >
-                    {depositMutation.isPending ? "Depositing..." : "Deposit"}
+                    {depositMutation.isPending ? (
+                      <>
+                        <span className="spinner" />
+                        Depositing...
+                  </>
+                ) : (
+                      "Deposit"
+                    )}
                   </button>
                 </div>
               </form>
               {depositMutation.isError && (
-                <p className="muted" style={{ marginTop: "0.5rem", fontSize: "0.875rem" }}>
-                  Error: {(depositMutation.error as Error)?.message ?? "Unknown error"}
-                </p>
-              )}
+                <div className="alert error" style={{ marginTop: "1rem" }}>
+                  <div>
+                    <strong>Deposit failed:</strong>
+                    <p style={{ margin: "0.25rem 0 0 0", fontSize: "0.875rem" }}>
+                      {(depositMutation.error as Error)?.message ?? "Unknown error"}
+                    </p>
+              </div>
+            </div>
+          )}
             </div>
             <div>
               <h3 style={{ fontSize: "1rem", marginBottom: "0.5rem" }}>Fund Gas (Native USDC)</h3>
@@ -1309,7 +1638,20 @@ const App = () => {
             (emergency withdraw).
           </p>
         </section>
+            )}
+          </div>
+        </div>
 
+        {/* Payments Tab */}
+        <div className={clsx("tab-content", activeTab === "payments" && "active")}>
+          <div className="stack">
+            {selectedAgentId === null ? (
+              <section className="card">
+                <h2>Payments</h2>
+                <p className="muted">Please select an agent from the Agents tab first.</p>
+              </section>
+            ) : (
+              <>
         <section className="card">
           <h2>Merchant Whitelist</h2>
           <form className="grid" onSubmit={handleWhitelistSubmit}>
@@ -1388,11 +1730,26 @@ const App = () => {
             </div>
           </form>
         </section>
+              </>
+            )}
+                </div>
+            </div>
 
+        {/* Activity Log - Visible on all tabs, at the bottom */}
         <section className="card">
-          <h2>Activity Log</h2>
+          <h2>
+            Activity Log
+            {logs.length > 0 && (
+              <span className="ai-badge" style={{ marginLeft: "1rem", fontSize: "0.75rem" }}>
+                {logs.length} events
+              </span>
+            )}
+          </h2>
           {logs.length === 0 ? (
-            <p className="muted">Everything you do in this dashboard will show up here.</p>
+            <div style={{ textAlign: "center", padding: "2rem" }}>
+              <img src="/AI.gif" alt="AI Agent" className="ai-gif-large" style={{ marginBottom: "1rem" }} />
+              <p className="muted">AI agent activities will appear here</p>
+            </div>
           ) : (
             <div className="log">
               {logs.map((entry) => (
@@ -1404,6 +1761,72 @@ const App = () => {
           )}
         </section>
       </main>
+      
+      {/* Password Modal */}
+      {passwordModal.open && (
+        <div 
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: "rgba(0, 0, 0, 0.7)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 10000,
+            backdropFilter: "blur(4px)"
+          }}
+          onClick={handlePasswordCancel}
+        >
+          <div 
+            className="card"
+            style={{
+              maxWidth: "500px",
+              width: "90%",
+              margin: "1rem",
+              position: "relative"
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 style={{ marginTop: 0 }}>{passwordModal.title}</h2>
+            <p className="muted" style={{ marginBottom: "1.5rem" }}>
+              {passwordModal.message}
+            </p>
+            <div className="input-group">
+              <label htmlFor="passwordInput">Password</label>
+              <input
+                id="passwordInput"
+                type="password"
+                placeholder="Enter password"
+                value={passwordInput}
+                onChange={(e) => setPasswordInput(e.target.value)}
+                onKeyPress={handlePasswordKeyPress}
+                autoFocus
+                style={{ fontFamily: "monospace" }}
+              />
+            </div>
+            <div style={{ display: "flex", gap: "0.75rem", justifyContent: "flex-end", marginTop: "1.5rem" }}>
+              <button
+                className="button secondary"
+                type="button"
+                onClick={handlePasswordCancel}
+              >
+                Cancel
+              </button>
+              <button
+                className="button"
+                type="button"
+                onClick={handlePasswordConfirm}
+                disabled={passwordInput.length === 0}
+              >
+                Confirm
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
