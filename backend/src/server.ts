@@ -455,6 +455,14 @@ app.post("/agent/pay", async (req, res, next) => {
       account: record.account
     });
 
+    // Get agent config from contract to verify address matches
+    const agentConfig = await publicClient.readContract({
+      address: env.AGENT_WALLET_ADDRESS as Hex,
+      abi: agentWalletAbi,
+      functionName: "agent",
+      args: [BigInt(agentId)]
+    });
+
     // Verify agent address matches
     const agentAddress = (agentConfig as { agent: Hex }).agent;
     if (record.account.address.toLowerCase() !== agentAddress.toLowerCase()) {
