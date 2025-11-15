@@ -158,17 +158,23 @@ const app = express();
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   
-  // Allow all origins in development
-  res.setHeader("Access-Control-Allow-Origin", origin || "*");
+  // Allow all origins - if credentials are needed, must specify origin (not *)
+  // For now, allow all origins for simplicity
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  } else {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
+  
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH");
   res.setHeader(
     "Access-Control-Allow-Headers",
     "Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control"
   );
-  res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Max-Age", "86400"); // 24 hours
   
-  // Handle preflight requests
+  // Handle preflight requests - MUST return early for OPTIONS
   if (req.method === "OPTIONS") {
     res.status(200).end();
     return;
