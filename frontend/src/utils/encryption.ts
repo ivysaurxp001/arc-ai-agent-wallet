@@ -117,3 +117,4 @@ export function isEncrypted(data: string): boolean {
   return data.includes(":") && data.split(":").length === 3;
 }
 
+

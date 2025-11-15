@@ -1,7 +1,8 @@
 import axios from "axios";
 
-// Use /api which will be proxied to backend by Vite
-const baseURL = "/api";
+// In production (Vercel), use VITE_API_URL if set, otherwise use /api
+// In development, Vite proxy will handle /api -> backend
+const baseURL = import.meta.env.VITE_API_URL || "/api";
 
 export const api = axios.create({
   baseURL,

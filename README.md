@@ -104,6 +104,51 @@ npm run dev
 - `GET /agent/:agentId` - Get agent details
 - `GET /healthz` - Health check
 
+## Deployment
+
+### Frontend (Vercel)
+
+1. Push code to GitHub
+2. Import project in Vercel
+3. **Set Environment Variable:**
+   - Go to Project Settings → Environment Variables
+   - Add: `VITE_API_URL` = `https://your-backend-url.com` (no trailing slash)
+4. Deploy
+
+### Backend (Railway/Render/Fly.io)
+
+**Option 1: Railway**
+1. Go to [Railway](https://railway.app) and create new project
+2. Connect your GitHub repo
+3. **Set Root Directory (IMPORTANT):**
+   - Click on your service → **Settings** tab
+   - Look for **"Source"** section
+   - Find **"Root Directory"** field (or **"Working Directory"**)
+   - Enter: `backend`
+   - Click **Save**
+   - **Alternative:** If you don't see this option, Railway will use `railway.json` at root (already configured)
+4. **Add Environment Variables:**
+   - Go to **Variables** tab
+   - Add these variables:
+     ```
+     ARC_RPC_URL=https://rpc.testnet.arc.network
+     AGENT_WALLET_ADDRESS=0x4269805051a94630e145F8A179764E2f6b8D3B95
+     USDC_ADDRESS=0x3600000000000000000000000000000000000000
+     OWNER_PRIVATE_KEY=0x<your_owner_private_key>
+     PORT=3001
+     ```
+5. Railway will use build commands from `railway.json` (builds from `backend/` directory)
+6. Deploy (auto-deploys on push to main branch)
+
+**Option 2: Render**
+1. Create new Web Service
+2. Set root directory to `backend`
+3. Build command: `npm install && npm run build`
+4. Start command: `npm start`
+5. Add environment variables (same as above)
+
+**Important:** After deploying backend, update `VITE_API_URL` in Vercel with your backend URL.
+
 ## Security Notes
 
 - Agent private keys stored in backend memory (demo only)
