@@ -6,6 +6,7 @@ import {
   createPublicClient,
   createWalletClient,
   decodeEventLog,
+  decodeErrorResult,
   http
 } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -690,9 +691,9 @@ app.post("/agent/deposit", async (req, res, next) => {
       let errorMessage = (error as Error).message;
       if (error?.data) {
         try {
-          const decoded = await publicClient.decodeErrorResult({
+          const decoded = decodeErrorResult({
             abi: agentWalletAbi,
-            data: error.data
+            data: error.data as Hex
           });
           errorMessage = `Contract error: ${decoded.errorName}`;
           logger.error({ decoded, agentId, amount: amount.toString() }, "Contract revert");
