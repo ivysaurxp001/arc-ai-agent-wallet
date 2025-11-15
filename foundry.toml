@@ -1,0 +1,14 @@
+[fmt]
+line_length = 120
+tab_spaces = 4
+
+[profile.default]
+solc = "0.8.24"
+auto_detect_remappings = true
+src = "src"
+test = "test"
+libs = ["lib"]
+optimizer = true
+optimizer_runs = 200
+
+
